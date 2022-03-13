@@ -1,0 +1,193 @@
+---
+title: "temperaCura by [hinc] Radek"
+output: html_notebook
+---
+
+```{r}
+#1 Na poczatku okreslamy czy dzialamy na faktycznych danych konkursowych (bContest = T) czy tez na probce (bContest = F).
+
+# dane konkursowe (T) czy wczesniej udostepniona probka danych (F)
+bContest = T
+
+# czy trzeba odpakowywac dane (T/F)?
+bGunzip <- F
+
+# ustawiamy sciezki
+if(bContest == T) {
+  cDatasetPath = "datasets/contest/"
+} else {
+  cDatasetPath = "datasets/sample/"
+}
+
+# ladujemy nasz pomocniczy skrypt
+source("hinc-functions.R")
+
+# instalujemy pakiety?
+bInstall = F
+
+if(bInstall) {
+  install.packages(c("caret", "R.utils", "stringr", "ggplot2", "pracma"))
+}
+
+hincPrint <- function(nStep, cType, cMessage) {
+  print(sprintf("Krok #%s: %s - %s", nStep, cType, cMessage))
+}
+
+hincPrint(1, "done", "paths prepared")
+```
+
+
+
+```{r}
+#2 Rozpakowujemy dane.
+
+# ladujemy biblioteke do dekompresji gzipa
+library(R.utils)
+
+lFiles <- list.files(path=cDatasetPath, pattern="*.gz", full.names=TRUE, recursive=FALSE)
+if(bGunzip == T) {
+  if(length(lFiles) > 0) {
+    # rozpakowujemy, ale zostawiamy plik skompresowany
+    for(cFile in lFiles) {
+      gunzip(cFile, remove = F)
+    }
+    hincPrint(2, "done", "pliki rozpakowane")
+  } else {
+    hincPrint(2, "problem", "brak plikow do zaladowania")
+  }
+} else {
+  hincPrint(2, "done", "nie trzeba rozpakowywac plikow")
+}
+
+```
+
+```{r}
+#3 Ladujemy dane instrumentow
+library(stringr)
+
+# czy ladowac dane
+if(exists("dfMeasurements") && exists("dfTemperatures")) {
+  bLoad = F
+} else {
+  bLoad = T
+}
+
+if(bLoad == T) {
+  dfMeasurements <- data.frame()
+  for(cFile in lFiles) {
+    dfMeasurements <- rbind(dfMeasurements, read.csv(cFile))
+  }
+  hincPrint(3, "done", paste0("dane instrumentow zaladowane (", nrow(dfMeasurements), " rekordow)"))
+} else {
+  hincPrint(3, "done", paste0("dane instrumentow juz byly zaladowane (", nrow(dfMeasurements), " rekordow)"))
+}
+
+# obcinamy informacje o strefie czasowej
+dfMeasurements$czas <- substr(dfMeasurements$czas, 1, str_count(as.character(dfMeasurements[1,]$czas)) - 6)
+
+# robimy backup data frame'a
+dfMeasurementsBAK <- dfMeasurements
+```
+
+```{r}
+
+#4 Ladujemy dane temperatur
+
+if(bLoad == T) {
+  dfTemperatures <- read.csv2(paste0(cDatasetPath,"temp_zuz.csv"))
+  hincPrint(4, "done", paste0("historyczne temperatury zaladowane (", nrow(dfTemperatures), " rekordow)"))
+} else {
+  hincPrint(4, "done", paste0("historyczne temperatury juz byly zaladowane (", nrow(dfTemperatures), " rekordow)"))
+}
+
+```
+
+```{r}
+#5 Modelowanie danych i trenowanie modelu
+
+# do modelowania wykorzystuje podejscie, ktore liczy 
+
+library(pracma)
+library(caret)
+
+# data na unix timestamp
+dfTemperatures$timestamp <- as.numeric(as.POSIXct(dfTemperatures$Czas))
+dfMeasurements$timestamp <- as.numeric(as.POSIXct(dfMeasurements$czas))
+
+# pozbywamy sie wpisow temperatur o niepelnych godzinach
+dfTemperatures <- dfTemperatures[dfTemperatures$timestamp%%3600 == 0, ]
+
+# tworzymy macierz na 
+dfPredictor <- matrix(nrow=nrow(dfTemperatures)-1, ncol=59)
+
+
+for(i in 2:nrow(dfTemperatures)) {
+  print(i)
+  # do celow 'pamieciowych' pobieramy podzbior pelnych pomiarow - z ostatniej godziny
+  dfMeasurementsSubset <- dfMeasurements[dfMeasurements$timestamp < dfTemperatures[i, ]$timestamp, ]
+  dfMeasurementsSubset <- dfMeasurementsSubset[dfMeasurementsSubset$timestamp > dfTemperatures[i - 1, ]$timestamp, ]
+
+  # pierwsze dwie kolumny - timestamp i temperatura
+  dfPredictor[i-1,1] <- dfTemperatures[i, ]$timestamp
+  dfPredictor[i-1,2] <- dfTemperatures[i, ]$temp_zuz
+  
+  # kolejne kolumny - wykladnicza srednia kroczaca pomiarow instrumentow z ostatniej godziny, najnowsze pomiary - najwazniejsze
+  for(j in 2:58) {
+    values <- movavg(dfMeasurementsSubset[, j], 58, type="e")
+    dfPredictor[i-1, j+1] <- values[59]
+  }
+}
+
+# pracujemy na 10000 rejestracjach temperatur
+dfPredictor <- dfPredictor[1:10000, ]
+
+# tworzymy macierz korelacji pomiedzy atrybutami (bez temperatury)
+correlations <- cor(dfPredictor[, 3:59], method = "pearson", use = "complete.obs")
+
+dfPredictor <- as.data.frame(dfPredictor)
+
+# szukamy takich atrybutow, ktore sa najbardziej skorelowane z innymi
+columnsToRemove <- findCorrelation(
+  correlations,
+  cutoff = 0.9,
+  verbose = FALSE,
+  names = FALSE,
+  exact = ncol(correlations) < 100
+)
+
+# usuwamy te skorelowane kolumny
+columnsToRemove <- columnsToRemove+2
+dfPredictor <- as.data.frame(dfPredictor[, -columnsToRemove ] )
+
+# usuwamy timestamp
+dfPredictor <- dfPredictor[, 2:32]
+
+# ustawiamy parametry kroswalidacji (10-fold)
+fitControl <- trainControl(method = "cv",   
+                           number = 10)    
+
+# trenujemy model na 80% danych
+model <- train(V2 ~ .,
+               data = dfPredictor[1:8000, ],
+               method = "xgbTree",
+               trControl = fitControl,
+               verbose = TRUE)
+
+hincPrint(5, "done", paste0("trenowanie modelu zakonczone (RMSE: ", round(mean(model$results$RMSE),4),")"))
+
+```
+
+```{r}
+
+# data frame output zawiera zbior testowy
+real <- dfPredictor[8001:10000, ]$V2
+predicted <- as.numeric(predict(model, dfPredictor[8001:10000,]))
+output <- data.frame(1:2000, real, predicted)
+names(output) <- c("point", "real", "predicted")
+
+# rysujemy probke danych testowych dla dwustu rekordow - niebieskie to rzeczywiste, czerwone - predykcja
+sample <- output[201:400, ]
+ggplot() + geom_line(data=sample, aes(x = point, y=real), color="blue") + geom_line(data=sample, aes(x = point, y=predicted), color = "red") +
+  xlab("Punkt pomiaru temperatury") + ylab("Temperatura (C)") + ggtitle("Predykcja (czerwone) vs rzeczywistosc (niebieskie)")
+
+```
