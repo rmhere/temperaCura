@@ -19,9 +19,6 @@ if(bContest == T) {
   cDatasetPath = "datasets/sample/"
 }
 
-# ladujemy nasz pomocniczy skrypt
-source("hinc-functions.R")
-
 # instalujemy pakiety?
 bInstall = F
 
